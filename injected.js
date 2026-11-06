@@ -110,84 +110,91 @@
       };
     }
 
-    function processParsedData(data, threadIdFallback = '') {
-      if (!data || typeof data !== 'object') return;
+    function deepScanForInstagramMessages(obj, threadIdFallback = '') {
+      if (!obj || typeof obj !== 'object') return;
+
       try {
-        if (data.thread && typeof data.thread === 'object') {
-          const th = data.thread;
-          const thId = th.thread_id || threadIdFallback;
-          if (Array.isArray(th.users)) {
-            for (const u of th.users) {
-              const uid = String(u.pk || u.id || '');
-              if (uid) igUsersById.set(uid, u);
-            }
-          }
-          if (Array.isArray(th.items)) {
-            const userObj = Object.fromEntries(igUsersById);
-            for (const item of th.items) {
-              const norm = normalizeInstagramItem(item, thId, userObj);
-              if (norm && norm.messageId) {
-                igCapturedMessages.set(norm.messageId, norm);
-                emitToContentScript('IG_MSG_CAPTURED', norm);
-              }
-            }
-          }
-        }
-
-        if (data.inbox && Array.isArray(data.inbox.threads)) {
-          for (const th of data.inbox.threads) {
-            const thId = th.thread_id;
-            if (Array.isArray(th.users)) {
-              for (const u of th.users) {
-                const uid = String(u.pk || u.id || '');
-                if (uid) igUsersById.set(uid, u);
-              }
-            }
-            if (Array.isArray(th.items)) {
-              const userObj = Object.fromEntries(igUsersById);
-              for (const item of th.items) {
-                const norm = normalizeInstagramItem(item, thId, userObj);
-                if (norm && norm.messageId) {
-                  igCapturedMessages.set(norm.messageId, norm);
-                  emitToContentScript('IG_MSG_CAPTURED', norm);
-                }
-              }
-            }
+        // 1. Detect unsend command / item_removed
+        if (
+          obj.action_type === 'item_removed' ||
+          obj.action === 'item_removed' ||
+          obj.event === 'item_removed' ||
+          obj.status === 'item_removed' ||
+          (typeof obj.item_type === 'string' &&
+            obj.item_type === 'placeholder' &&
+            /unsent/i.test(obj.text || ''))
+        ) {
+          const itemId = String(obj.item_id || obj.payload?.item_id || '');
+          if (itemId) {
+            dlog('IG_UNSENT_DEEP', '#e74c3c', 'Phát hiện unsend từ payload:', itemId);
+            emitToContentScript('IG_MSG_UNSENT', {
+              messageId: itemId,
+              threadId: String(obj.thread_id || threadIdFallback || '')
+            });
           }
         }
 
-        if (data.payload && data.payload.item_id) {
+        // 2. Register users
+        if (Array.isArray(obj.users)) {
+          for (const u of obj.users) {
+            const uid = String(u.pk || u.id || '');
+            if (uid) igUsersById.set(uid, u);
+          }
+        }
+
+        // 3. Detect single message item
+        if (
+          obj.item_id &&
+          (obj.text !== undefined ||
+            obj.item_type ||
+            obj.media ||
+            obj.visual_media ||
+            obj.voice_media)
+        ) {
+          const userObj = Object.fromEntries(igUsersById);
+          const norm = normalizeInstagramItem(obj, obj.thread_id || threadIdFallback, userObj);
+          if (norm && norm.messageId && !igCapturedMessages.has(norm.messageId)) {
+            igCapturedMessages.set(norm.messageId, norm);
+            dlog('IG_CAPTURED', '#2ecc71', 'Bắt được tin nhắn Instagram:', norm.messageId, norm.text);
+            emitToContentScript('IG_MSG_CAPTURED', norm);
+          }
+        }
+
+        // 4. Broadcast response payload
+        if (obj.payload && obj.payload.item_id) {
           const norm = {
             platform: 'instagram',
-            messageId: String(data.payload.item_id),
-            threadId: String(data.payload.thread_id || threadIdFallback || ''),
+            messageId: String(obj.payload.item_id),
+            threadId: String(obj.payload.thread_id || threadIdFallback || ''),
             senderId: 'self',
             senderName: 'Bạn',
             senderAvatar: '',
-            text: data.payload.text || '',
+            text: obj.payload.text || '',
             attachments: [],
             mediaType: 'none',
-            timestamp: data.payload.timestamp
-              ? Math.floor(Number(data.payload.timestamp) / 1000)
+            timestamp: obj.payload.timestamp
+              ? Math.floor(Number(obj.payload.timestamp) / 1000)
               : Date.now(),
             source: 'IG_BROADCAST'
           };
-          igCapturedMessages.set(norm.messageId, norm);
-          emitToContentScript('IG_MSG_CAPTURED', norm);
+          if (!igCapturedMessages.has(norm.messageId)) {
+            igCapturedMessages.set(norm.messageId, norm);
+            emitToContentScript('IG_MSG_CAPTURED', norm);
+          }
         }
 
-        if (
-          data.action_type === 'item_removed' ||
-          data.action === 'item_removed' ||
-          data.event === 'item_removed' ||
-          data.status === 'item_removed'
-        ) {
-          const itemId = String(data.item_id || data.payload?.item_id || '');
-          if (itemId) {
-            emitToContentScript('IG_MSG_UNSENT', {
-              messageId: itemId,
-              threadId: String(data.thread_id || '')
-            });
+        // 5. Traverse child structures
+        if (Array.isArray(obj)) {
+          for (const item of obj) {
+            deepScanForInstagramMessages(item, threadIdFallback);
+          }
+        } else {
+          for (const k of Object.keys(obj)) {
+            if (k !== 'users' && obj[k] && typeof obj[k] === 'object') {
+              const nextThreadId =
+                obj.thread_id || obj.thread?.thread_id || threadIdFallback;
+              deepScanForInstagramMessages(obj[k], nextThreadId);
+            }
           }
         }
       } catch (_) {}
@@ -224,26 +231,57 @@
       return '';
     }
 
+    function safeParseJsonString(rawStr) {
+      if (!rawStr || typeof rawStr !== 'string') return null;
+      let clean = rawStr.trim();
+      if (clean.startsWith('for (;;);')) {
+        clean = clean.slice(9).trim();
+      }
+      try {
+        return JSON.parse(clean);
+      } catch (_) {
+        return null;
+      }
+    }
+
     // --- Hook fetch ---
     if (typeof window.fetch === 'function') {
       const origFetch = window.fetch;
       window.fetch = async function (resource, config) {
+        const url = typeof resource === 'string' ? resource : resource?.url || '';
+
+        // Check if outgoing delete/unsend request
+        if (url && (url.includes('/delete/') || (config && config.method === 'POST' && url.includes('/delete')))) {
+          const m = url.match(/threads\/([^\/]+)\/items\/([^\/]+)\/delete/);
+          if (m) {
+            dlog('IG_FETCH_UNSEND', '#e74c3c', 'Phát hiện unsend qua Fetch request:', m[2]);
+            emitToContentScript('IG_MSG_UNSENT', {
+              threadId: m[1],
+              messageId: m[2]
+            });
+          }
+        }
+
         const resp = await origFetch.apply(this, arguments);
         try {
-          const url = typeof resource === 'string' ? resource : resource?.url || '';
           if (
-            url.includes('/direct_v2/') ||
-            url.includes('/graphql/query') ||
-            url.includes('/api/v1/direct_v2/')
+            url &&
+            (url.includes('/graphql') ||
+              url.includes('/direct') ||
+              url.includes('/threads') ||
+              url.includes('/api/v1/'))
           ) {
             resp
               .clone()
-              .json()
-              .then((data) => {
-                let threadId = '';
-                const match = url.match(/threads\/([a-zA-Z0-9_-]+)/);
-                if (match) threadId = match[1];
-                processParsedData(data, threadId);
+              .text()
+              .then((txt) => {
+                const data = safeParseJsonString(txt);
+                if (data) {
+                  let threadId = '';
+                  const match = url.match(/threads\/([a-zA-Z0-9_-]+)/);
+                  if (match) threadId = match[1];
+                  deepScanForInstagramMessages(data, threadId);
+                }
               })
               .catch(() => {});
           }
@@ -258,23 +296,37 @@
       const origXhrSend = XMLHttpRequest.prototype.send;
       XMLHttpRequest.prototype.open = function (method, url) {
         this.__igUrl = String(url || '');
+        this.__igMethod = String(method || '');
         return origXhrOpen.apply(this, arguments);
       };
       XMLHttpRequest.prototype.send = function (body) {
+        const url = this.__igUrl || '';
+        if (url && (url.includes('/delete/') || (this.__igMethod === 'POST' && url.includes('/delete')))) {
+          const m = url.match(/threads\/([^\/]+)\/items\/([^\/]+)\/delete/);
+          if (m) {
+            dlog('IG_XHR_UNSEND', '#e74c3c', 'Phát hiện unsend qua XHR request:', m[2]);
+            emitToContentScript('IG_MSG_UNSENT', {
+              threadId: m[1],
+              messageId: m[2]
+            });
+          }
+        }
+
         this.addEventListener('load', function () {
           try {
-            const url = this.__igUrl || '';
             if (
-              url.includes('/direct_v2/') ||
-              url.includes('/graphql/query') ||
-              url.includes('/api/v1/direct_v2/')
+              url &&
+              (url.includes('/graphql') ||
+                url.includes('/direct') ||
+                url.includes('/threads') ||
+                url.includes('/api/v1/'))
             ) {
-              if (typeof this.responseText === 'string' && this.responseText.length > 0) {
-                const data = JSON.parse(this.responseText);
+              const data = safeParseJsonString(this.responseText);
+              if (data) {
                 let threadId = '';
                 const match = url.match(/threads\/([a-zA-Z0-9_-]+)/);
                 if (match) threadId = match[1];
-                processParsedData(data, threadId);
+                deepScanForInstagramMessages(data, threadId);
               }
             }
           } catch (_) {}
@@ -312,13 +364,13 @@
               ) {
                 try {
                   const parsed = JSON.parse(text);
-                  processParsedData(parsed);
+                  deepScanForInstagramMessages(parsed);
                 } catch (_) {
                   const matches = text.match(/\{[^{}]*"item_id"[^{}]*\}/g);
                   if (matches) {
                     for (const m of matches) {
                       try {
-                        processParsedData(JSON.parse(m));
+                        deepScanForInstagramMessages(JSON.parse(m));
                       } catch (_) {}
                     }
                   }
@@ -341,7 +393,7 @@
       try {
         if (typeof result === 'string' && result.length > 10 && result.includes('"item_id"')) {
           try {
-            processParsedData(JSON.parse(result));
+            deepScanForInstagramMessages(JSON.parse(result));
           } catch (_) {}
         }
       } catch (_) {}

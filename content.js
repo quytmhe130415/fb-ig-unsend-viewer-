@@ -245,30 +245,127 @@
         bubble.appendChild(mediaContainer);
       }
 
-      containerEl.appendChild(bubble);
+      if (nextSibling && nextSibling.parentNode === parent) {
+        parent.insertBefore(bubble, nextSibling);
+      } else {
+        parent.appendChild(bubble);
+      }
     }
 
-    function scanInstagramChatDom() {
+    const domTrackedNodes = new Map();
+    let lastKnownPath = location.pathname;
+
+    function extractMessageFromElement(el) {
+      if (!el || !(el instanceof HTMLElement)) return null;
+      if (
+        el.classList.contains('ig-unsend-restored-bubble') ||
+        el.closest('.ig-unsend-restored-bubble')
+      ) {
+        return null;
+      }
+
+      // 1. Text extraction
+      const textEls = el.querySelectorAll('div[dir="auto"], span[dir="auto"], p');
+      let text = '';
+      for (const tEl of textEls) {
+        const str = tEl.textContent?.trim();
+        if (str && !/^(đã thu hồi|unsent|seen|đã xem)/i.test(str)) {
+          text = str;
+          break;
+        }
+      }
+      if (!text && el.getAttribute('dir') === 'auto') {
+        text = el.textContent?.trim() || '';
+      }
+
+      // 2. Media extraction
+      const attachments = [];
+      let mediaType = 'none';
+
+      const imgs = el.querySelectorAll('img[src*="cdninstagram"], img[src*="fbcdn"]');
+      for (const img of imgs) {
+        if (
+          img.src &&
+          !img.src.includes('profile') &&
+          !img.src.includes('avatar') &&
+          img.width > 30
+        ) {
+          attachments.push(img.src);
+          mediaType = 'image';
+        }
+      }
+
+      const videos = el.querySelectorAll('video[src], video source[src]');
+      for (const vid of videos) {
+        const src = vid.src || vid.getAttribute('src');
+        if (src) {
+          attachments.push(src);
+          mediaType = 'video';
+        }
+      }
+
+      const audios = el.querySelectorAll('audio[src], audio source[src]');
+      for (const aud of audios) {
+        const src = aud.src || aud.getAttribute('src');
+        if (src) {
+          attachments.push(src);
+          mediaType = 'audio';
+        }
+      }
+
+      if (!text && attachments.length === 0) return null;
+
+      const generatedId = `ig_dom_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      return {
+        messageId: generatedId,
+        text,
+        attachments,
+        mediaType,
+        senderName: 'Bạn bè',
+        timestamp: Date.now()
+      };
+    }
+
+    function scanAndTrackInstagramDom() {
       try {
-        const mainChat = document.querySelector('div[role="main"]') || document.body;
-        const walker = document.createTreeWalker(mainChat, NodeFilter.SHOW_TEXT, null, false);
-        const unsendNodes = [];
-        let n;
-        const UNSEND_RE =
-          /(đã thu hồi một tin nhắn|đã gỡ một tin nhắn|unsent a message|tin nhắn đã bị thu hồi)/i;
-        while ((n = walker.nextNode())) {
-          if (n.nodeValue && UNSEND_RE.test(n.nodeValue)) {
-            unsendNodes.push(n);
-          }
+        const main = document.querySelector('div[role="main"]') || document.body;
+        if (location.pathname !== lastKnownPath) {
+          lastKnownPath = location.pathname;
+          domTrackedNodes.clear();
         }
 
-        for (const textNode of unsendNodes) {
-          const parent = textNode.parentElement;
-          if (parent && !parent.querySelector('.ig-unsend-restored-bubble')) {
-            const latestUnsent = unsentMessagesList[0];
-            if (latestUnsent) {
-              renderRestoredBubbleForElement(parent, latestUnsent);
-            }
+        const candidates = main.querySelectorAll(
+          'div[role="none"], div[role="row"], div[role="listitem"], div[dir="auto"], span[dir="auto"]'
+        );
+        for (const cand of candidates) {
+          const bubbleContainer = cand.closest('div[role="none"]') || cand.parentElement;
+          if (
+            !bubbleContainer ||
+            domTrackedNodes.has(bubbleContainer) ||
+            bubbleContainer.dataset.igTracked
+          ) {
+            continue;
+          }
+
+          const extracted = extractMessageFromElement(bubbleContainer);
+          if (extracted) {
+            bubbleContainer.dataset.igTracked = 'true';
+            domTrackedNodes.set(bubbleContainer, {
+              ...extracted,
+              element: bubbleContainer,
+              parent: bubbleContainer.parentElement,
+              nextSibling: bubbleContainer.nextSibling
+            });
+
+            handleCapturedMessage({
+              platform: 'instagram',
+              messageId: extracted.messageId,
+              text: extracted.text,
+              attachments: extracted.attachments,
+              mediaType: extracted.mediaType,
+              senderName: extracted.senderName,
+              timestamp: extracted.timestamp
+            });
           }
         }
       } catch (_) {}
@@ -277,17 +374,81 @@
     let scanTimer = null;
     function scheduleDomScan() {
       if (scanTimer) clearTimeout(scanTimer);
-      scanTimer = setTimeout(scanInstagramChatDom, 100);
+      scanTimer = setTimeout(scanAndTrackInstagramDom, 120);
     }
 
-    const observer = new MutationObserver(() => {
+    const observer = new MutationObserver((mutations) => {
+      if (location.pathname !== lastKnownPath) {
+        lastKnownPath = location.pathname;
+        domTrackedNodes.clear();
+      }
+
+      const unsendCandidates = [];
+      for (const mutation of mutations) {
+        for (const removedNode of mutation.removedNodes) {
+          if (!(removedNode instanceof HTMLElement)) continue;
+
+          for (const [trackedEl, data] of domTrackedNodes.entries()) {
+            if (trackedEl === removedNode || removedNode.contains(trackedEl)) {
+              unsendCandidates.push(data);
+              domTrackedNodes.delete(trackedEl);
+            }
+          }
+        }
+      }
+
+      // Khi phát hiện node tin nhắn vừa bị Instagram xoá khỏi màn hình
+      if (unsendCandidates.length > 0 && unsendCandidates.length <= 5) {
+        for (const unsentData of unsendCandidates) {
+          const record = {
+            platform: 'instagram',
+            messageId: unsentData.messageId,
+            text: unsentData.text,
+            attachments: unsentData.attachments,
+            mediaType: unsentData.mediaType,
+            senderName: unsentData.senderName,
+            timestamp: unsentData.timestamp,
+            isUnsent: true,
+            unsentAt: Date.now()
+          };
+
+          unsentMessagesList.unshift(record);
+          if (unsentMessagesList.length > MAX_STORED_MESSAGES) {
+            unsentMessagesList.pop();
+          }
+          persistUnsent();
+
+          try {
+            chrome.runtime.sendMessage({
+              type: 'INCREMENT_UNREAD_BADGE',
+              platform: 'instagram'
+            });
+          } catch (_) {}
+
+          if (isToastEnabled) {
+            showInstagramToast(record);
+          }
+
+          if (unsentData.parent && unsentData.parent.isConnected) {
+            renderRestoredBubbleAtPosition(
+              unsentData.parent,
+              unsentData.nextSibling,
+              record
+            );
+          }
+        }
+      }
+
       scheduleDomScan();
     });
+
     if (document.body) {
       observer.observe(document.body, { childList: true, subtree: true });
+      scheduleDomScan();
     } else {
       document.addEventListener('DOMContentLoaded', () => {
         observer.observe(document.body, { childList: true, subtree: true });
+        scheduleDomScan();
       });
     }
 
